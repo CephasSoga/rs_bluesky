@@ -1,0 +1,9 @@
+[header]
+msg = ""
+
+[api]
+token = ""
+
+[websocket]
+server_addr = "wss://jetstream.atproto.tools/subscribe"
+buffer_size = 100
