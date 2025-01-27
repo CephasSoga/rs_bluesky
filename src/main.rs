@@ -8,20 +8,22 @@ pub mod config;
 pub mod jetstream;
 pub mod classifiers;
 pub mod generic_types;
+pub mod logging;
+pub mod utils;
 
-use std::str::FromStr;
+use std::sync::Arc;
+
+use crate::classifiers::naive_bayes::NaiveBayes;
 
 //use crate::classifiers::naive_bayes::example;
-use crate::jetstream::example;
+use crate::jetstream::ProxyServer;
 
 #[tokio::main]
-async fn main() {
-
-    let _commit = generic_types::Commit{
-        operation: "sub".to_string(), 
-        collection: "all".to_string(), 
-        record: Some(serde_json::Value::from_str("{\"text\": \"Hello\"}").unwrap()),   
-    };
-    //example(commit);
-    example().await;
+// *** Example usage (simplified) ***
+pub async fn main() -> Result<(), Box<dyn std::error::Error>>{
+    let classifier = Arc::new(NaiveBayes::load_from_file("naive_bayes_model.json")?);
+    let address = "0.0.0.0:8080";
+    let mut ws_server = ProxyServer::new(address, classifier);
+    ws_server.run().await?;
+    Ok(())
 }
