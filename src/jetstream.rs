@@ -61,56 +61,63 @@ struct Log {
 
 /// A struct to handle WebSocket streams
 pub struct JetStream {
-    receiver: SplitStream<WebSocketStreamType>,
+    ws_stream: WebSocketStreamType,
     sender: Sender<String>,
-    close_tx: Sender<()>, // Add a close sender
+    shutdown_rx: Receiver<()>,
 }
 
 impl JetStream {
     /// Create a new JetStream instance
-    pub async fn new(sender: Sender<String>, close_tx: Sender<()>) -> Self {
+    pub async fn new(sender: Sender<String>, shutdown_rx: Receiver<()>) -> Self {
         let config = Config::new().unwrap();
-
         let ws_addr = config.websocket.server_addr;
 
         let (ws_stream, _) = connect_async(ws_addr).await.expect("Failed to connect");
-        let (_, read) = ws_stream.split();
-
         JetStream {
-            receiver: read,
+            ws_stream,
             sender,
-            close_tx,
+            shutdown_rx,
         }
     }
 
     /// Process incoming WebSocket messages
     pub async fn handle(&mut self, classifier: &Arc<NaiveBayes>) {
-        while let Some(msg) = self.receiver.next().await {
-            match msg {
-                Ok(msg) if msg.is_text() => {
-                    let text = msg.into_text().unwrap();
-                    match serde_json::from_str::<Event>(&text) {
-                        Ok(event) => {
-                            let sender_clone = self.sender.clone();
-                            let classifier_clone = classifier.clone();
-                            task::spawn(async move {
-                                JetStream::forward(event, sender_clone, &classifier_clone).await;
-                            });
+        loop {
+            tokio::select! {
+                msg = self.ws_stream.next() => {
+                    match msg {
+                        Some(Ok(msg)) if msg.is_text() => {
+                            let text = msg.into_text().unwrap();
+                            match serde_json::from_str::<Event>(&text) {
+                                Ok(event) => {
+                                    let sender_clone = self.sender.clone();
+                                    let classifier_clone = classifier.clone();
+                                    task::spawn(async move {
+                                        JetStream::forward(event, sender_clone, &classifier_clone).await;
+                                    });
+                                }
+                                Err(err) => {
+                                    error!("Failed to parse event. | Error: {}", err);
+                                }
+                            }
                         }
-                        Err(err) => {
-                            error!("Failed to parse event. | Error: {}", err);
+                        Some(Ok(_)) => {} // Handle other message types if needed
+                        Some(Err(err)) => {
+                            error!("JetStream handle error. | Error: {}", err);
+                            break;
                         }
+                        None => break, // WebSocket connection closed
                     }
                 }
-                Ok(_) => {}
-                Err(err) => {
-                    error!("JetStream handle error. | Error:  {}", err);
+                _ = self.shutdown_rx.recv() => {
+                    info!("Shutdown signal received, closing JetStream.");
+                    // Close the WebSocket connection gracefully
+                    let _ = self.ws_stream.close(None).await;
+                    break;
                 }
             }
         }
-        info!("Disconnected from Jetstream.");
-        // Signal closure
-        let _ = self.close_tx.send(()).await; // Send close signal (ignore error)
+        info!("JetStream disconnected.");
     }
 
     /// Handle individual events
@@ -178,29 +185,28 @@ impl ProxyServer {
         };
 
         let (mut write, mut read) = ws_stream.split();
-        let (tx_ws, rx_ws) = mpsc::channel::<String>(100); // Channel for client-bound messages
-        let (tx_js, rx_js) = mpsc::channel::<String>(100); // Channel for JS-bound messages
-        let (close_tx, mut close_rx) = mpsc::channel::<()>(1); // Channel to signal closure
-        let tx_ws = tx_ws.clone();
+        let (tx_ws, rx_ws) = mpsc::channel::<String>(100);
+        let (tx_js, rx_js) = mpsc::channel::<String>(100);
+        let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
 
-        // *** Create and launch JetStream for this connection ***
-        let mut jetstream = JetStream::new(tx_js, close_tx).await;
-        let classifier_clone_js = classifier.clone();
+        // Create and launch JetStream for this connection
+        let mut jetstream = JetStream::new(tx_js, shutdown_rx).await;
+        let classifier_clone = classifier.clone();
         let js_handle  = tokio::spawn(async move {
-            jetstream.handle(&classifier_clone_js).await;
+            jetstream.handle(&classifier_clone).await;
         });
 
         // Spawn task to handle outgoing messages to client
         let ws_write_handle = tokio::spawn(async move {
-            let mut receiver_stream = ReceiverStream::new(rx_ws); // Convert Receiver to a stream
-            while let Some(msg) = receiver_stream.next().await { // Use the stream's next method
+            let mut receiver_stream = ReceiverStream::new(rx_ws);
+            while let Some(msg) = receiver_stream.next().await {
                 if write.send(Message::Text(msg)).await.is_err() {
                     break;
                 }
             }
         });
 
-        // *** Forward messages from JetStream to client ***
+        //Forward messages from JetStream to client ***
         let js_to_ws_handle  = {
             let tx_ws_ = tx_ws.clone();
             tokio::spawn(async move {
@@ -216,57 +222,48 @@ impl ProxyServer {
 
         let tx_ws_ = tx_ws.clone();
         // Handle incoming messages
-        while let Some(msg) = read.next().await {
-            let tx_ws = tx_ws_.clone();
-            match msg {
-                Ok(Message::Text(text)) => {
-                    match serde_json::from_str::<Value>(&text) {
-                        Ok(json) => {
-                            //Spawn a task to send filtered posts
-                            if let Some(log) = Self::process_message(json) {
-                                if tx_ws.send(log).await.is_err() {
+        let handle_messages = async {
+            while let Some(msg) = read.next().await {
+                let tx_ws = tx_ws_.clone();
+                match msg {
+                    Ok(Message::Text(text)) => {
+                        match serde_json::from_str::<Value>(&text) {
+                            Ok(json) => {
+                                //Spawn a task to send filtered posts
+                                if let Some(log) = Self::process_message(json) {
+                                    if tx_ws.send(log).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to parse JSON: {}", e);
+                                if let Err(_) = tx_ws.send("Invalid JSON".to_string()).await {
                                     break;
                                 }
                             }
                         }
-                        Err(e) => {
-                            error!("Failed to parse JSON: {}", e);
-                            if let Err(_) = tx_ws.send("Invalid JSON".to_string()).await {
-                                break;
-                            }
-                        }
                     }
+                    Ok(Message::Close(_)) => break,
+                    Err(e) => {
+                        warn!("Error receiving message: {}", e);
+                        break;
+                    }
+                    _ => {}
                 }
-                Ok(Message::Close(_)) => break,
-                Err(e) => {
-                    warn!("Error receiving message: {}", e);
-                    break;
-                }
-                _ => {}
             }
-        }
+        };
 
         tokio::select! {
-            _ = js_handle => {
-                info!("Client disconnected (JS write).");
-            }
-            _ = ws_write_handle => {
-                info!("Client disconnected (WS write).");
-            }
-            _ = js_to_ws_handle => {
-                info!("Client disconnected (JS to WS forward).");
-            }
-            _ = close_rx.recv() => { // Wait for JetStream closure signal
-                info!("JetStream disconnected.");
-            }
+            _ = js_handle => info!("JetStream task completed."),
+            _ = ws_write_handle => info!("Write task completed."),
+            _ = js_to_ws_handle => info!("Foward task completed."),
+            _ = handle_messages =>  {
+                info!("Client message handler completed.");
+                // Send final shutdown signal if not already sent
+                let _ = shutdown_tx.send(()).await;
+            },
         }
-        // Abort all tasks to ensure proper cleanup
-        //js_handle.abort();
-        //ws_write_handle.abort();
-        //js_to_ws_handle.abort();
-
-        info!("Connection handler finished.");
-
     }
 
     pub async fn run(&mut self) -> Result<(), Error> {
