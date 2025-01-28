@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 #![allow(unused_imports)]
 
+use std::fmt::format;
 use std::sync::Arc;
 
 //use tokio::sync::Mutex;
@@ -28,6 +29,8 @@ use tungstenite::protocol::WebSocketConfig;
 use crate::classifiers::naive_bayes::NaiveBayes;
 use crate::config::Config;
 use crate::logging::setup_logger;
+use crate::request_parser::params::TaskFunction;
+use crate::request_parser::parser::CallParser;
 
 
 type WebSocketStreamType = WebSocketStream<Stream<TokioAdapter<TcpStream>, TokioAdapter<TlsStream<TcpStream>>>>;
@@ -57,6 +60,11 @@ struct Log {
     text: String,
     time: i128,
     did: String,
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+struct ErrorLog {
+    error: String,
 }
 
 /// A struct to handle WebSocket streams
@@ -152,11 +160,11 @@ impl JetStream {
     }
 }
 
-pub struct  ProxyServer{
+pub struct  WebSocketProxyServer{
     address: String,
     classifier: Arc<NaiveBayes>,
 }
-impl ProxyServer {
+impl WebSocketProxyServer {
     pub fn new(addr: &str, classifier: Arc<NaiveBayes>) -> Self {
         setup_logger("trace");
         Self {
@@ -170,6 +178,34 @@ impl ProxyServer {
             Some(format!("Processed message: {}", post.text))
         } else {
             None
+        }
+    }
+
+    fn validate_message(s: &str) -> Result<(), String> {
+        info!("Parsing request...");
+        match CallParser::key_lookup_parse_json(s) {
+            Ok(req) => {
+                if req.target.to_str() == "task" {
+                    if let Some(task_args) = req.args.for_task {
+                        if let TaskFunction::RealTimeBlueSky = task_args.function {
+                            info!("Valid Request parameters were found.| Processing...");
+                            return Ok(());
+                        }
+                        return Err(format!("No valid function has been provided. 
+                        | The `args` field is missing a `function` field or the field holds an incorrect value."));
+                    }
+                    return Err(format!("There is no `args` field inside the call request json."));
+                } else {
+                    error!("Request target must be no other than `task` for this Websocket. 
+                    | Received: {}.", req.target.to_str());
+                    return  Err(format!("Request target must be no other than `task` for this Websocket. 
+                    | Received: {}.", req.target.to_str()));
+                }
+            },
+            Err(err) => {
+                error!("Request parameters are invalid.  | Args: {}. | Error: {}.", s, err);
+                return Err(format!("Request parameters are invalid.  | Args: {}. | Error: {}.", s, err))
+            }
         }
     }
 
@@ -227,6 +263,15 @@ impl ProxyServer {
                 let tx_ws = tx_ws_.clone();
                 match msg {
                     Ok(Message::Text(text)) => {
+                        // Validate the incoming message
+                        if let Err(validation_error) = Self::validate_message(&text) {
+                            error!("Invalid message received: {}. Error: {}", text, validation_error);
+                            let error_log = ErrorLog {error: validation_error};
+                            let _ = tx_ws.send(to_string(&error_log)
+                                .unwrap()).await; // Send the error message back
+                            break;
+                        }
+                        
                         match serde_json::from_str::<Value>(&text) {
                             Ok(json) => {
                                 //Spawn a task to send filtered posts
@@ -288,7 +333,7 @@ impl ProxyServer {
         while let Ok((stream, _addr)) = listener.accept().await {
             let classifier_ = self.classifier.clone();
             tokio::spawn(async move {
-                ProxyServer::handle_connection(stream, classifier_).await;
+                WebSocketProxyServer::handle_connection(stream, classifier_).await;
             });
         }
 
