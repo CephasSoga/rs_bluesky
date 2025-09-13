@@ -183,6 +183,16 @@ impl LookFor {
             where_: s.to_string(),
         }
     }
+
+    pub fn from_json(v: &Value) -> Self {
+        LookFor {
+            where_: v.as_str().unwrap().to_string(),
+        }
+    }
+    
+    pub fn to_json(&self) -> Value {
+        Value::String(self.where_.clone())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

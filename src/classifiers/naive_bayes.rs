@@ -1,180 +1,181 @@
+//! Naive Bayes classifier (cheap-first, batch-friendly second).
+//!
+//! Modes:
+//! - Sparse mode (default): fast & cheap for single texts (uses HashMaps).
+//! - Dense mode (optional): matrix dot product for big batches.
+//!
+//! Author: Cephas & ChatGPT
+
 use std::collections::HashMap;
-use regex::Regex;
+use std::fs;
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
-use std::io;
 use serde_json;
-use indicatif::{ProgressBar, ProgressStyle};
+use regex::Regex;
+use thiserror::Error;
+use ndarray::{Array2, Array1, Axis};
 
-use crate::generic_types::{Commit, FeedPost};
-
-
+/// Possible errors in Naive Bayes
 #[derive(Error, Debug)]
 pub enum NaiveBayesError {
-    #[error("Failed to save the model: {0}")]
-    SaveError(io::Error),
+    #[error("Failed to save/load: {0}")]
+    Io(#[from] std::io::Error),
 
-    #[error("Failed to load the model: {0}")]
-    LoadError(io::Error),
-
-    #[error("Failed to serialize or deserialize the model: {0}")]
-    SerializationError(serde_json::Error),
-
-    #[error("Invalid input: {0}")]
-    InputError(String),
+    #[error("Serialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
 }
 
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-/// Struct for the Naive Bayes Classifier
+/// The Naive Bayes model.
+/// Stores both HashMaps (cheap sparse mode) and an optional dense weight matrix.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NaiveBayes {
+    /// P(class)
     class_probabilities: HashMap<String, f64>,
+    /// P(word|class)
     word_probabilities: HashMap<String, HashMap<String, f64>>,
+    /// Vocabulary → index (used for dense mode)
     vocab: HashMap<String, usize>,
+
+    /// Optional dense weights (class × vocab)
+    /// Only built if you call `build_dense_matrix()`
+    #[serde(skip)]
+    wmat: Option<Array2<f32>>,
+    /// Class order for mapping rows of `wmat` back to labels
+    #[serde(skip)]
+    pub class_labels: Vec<String>,
 }
+
 impl NaiveBayes {
-    /// Create a new Naive Bayes classifier
-    pub fn new() -> Self {
-        NaiveBayes {
-            class_probabilities: HashMap::new(),
-            word_probabilities: HashMap::new(),
-            vocab: HashMap::new(),
+    /// Load NB model from a JSON file (previously trained & saved).
+    pub fn load_from_file(path: &str) -> Result<Self, NaiveBayesError> {
+        let content = fs::read_to_string(path)?;
+        let mut model: NaiveBayes = serde_json::from_str(&content)?;
+        // Build vocab from word_probabilities (cheap init)
+        let mut vocab = HashMap::new();
+        let mut idx = 0;
+        for class_probs in model.word_probabilities.values() {
+            for word in class_probs.keys() {
+                if !vocab.contains_key(word) {
+                    vocab.insert(word.clone(), idx);
+                    idx += 1;
+                }
+            }
+        }
+        model.vocab = vocab;
+        Ok(model)
+    }
+
+    /// Save the model to disk
+    pub fn save_to_file(&self, path: &str) -> Result<(), NaiveBayesError> {
+        let content = serde_json::to_string_pretty(self)?;
+        fs::write(path, content)?;
+        Ok(())
+    }
+
+    /// Build a dense weight matrix `W` for fast batched inference.
+    /// Shape: (num_classes, vocab_size).
+    pub fn build_dense_matrix(&mut self) {
+    let num_classes = self.class_probabilities.len();
+    let vocab_size = self.vocab.len();
+
+    let mut wmat = Array2::<f32>::zeros((num_classes, vocab_size));
+    let mut class_labels = Vec::new();
+
+    for (class_idx, (class, _)) in self.class_probabilities.iter().enumerate() {
+        class_labels.push(class.clone());
+
+        if let Some(word_probs) = self.word_probabilities.get(class) {
+            for (word, &p) in word_probs {
+                if let Some(&col) = self.vocab.get(word) {
+                    // Store log-probabilities
+                    wmat[(class_idx, col)] = p.ln() as f32;
+                }
+            }
         }
     }
 
-    /// Train the classifier with labeled data
-    pub fn train(&mut self, data: Vec<(String, String)>) {
-        let mut class_counts = HashMap::new();
-        let mut word_counts = HashMap::new();
+    self.wmat = Some(wmat);
+    self.class_labels = class_labels;
+}
 
-        // Tokenizer regex
+
+    // ------------------------
+    // Sparse (cheap) inference
+    // ------------------------
+
+    /// Classify a single text (cheap sparse mode).
+    pub fn classify_sparse(&self, text: &str) -> Option<String> {
         let re = Regex::new(r"\w+").unwrap();
-
-        // Initialize progress bar
-        let pb = ProgressBar::new(data.len() as u64);
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
-                .unwrap()
-                .progress_chars("#>-"),
-        );
-        pb.set_message("Training in progress...");
-
-
-        // Count classes and words
-        for (label, text) in data {
-            *class_counts.entry(label.clone()).or_insert(0) += 1;
-
-            let words = re
-                .find_iter(&text.to_lowercase())
-                .map(|m| m.as_str().to_string())
-                .collect::<Vec<String>>();
-
-            for word in words {
-                self.vocab.entry(word.clone()).or_insert(0);
-                *word_counts
-                    .entry(label.clone())
-                    .or_insert_with(HashMap::new)
-                    .entry(word)
-                    .or_insert(0) += 1;
-            }
-            // Increment progress bar
-            pb.inc(1);
-        }
-
-        // Finish progress bar
-        pb.finish_with_message("Training complete!");
-
-        // Calculate class probabilities
-        let total_docs = class_counts.values().sum::<usize>() as f64;
-        for (label, count) in class_counts {
-            self.class_probabilities.insert(label.clone(), count as f64 / total_docs);
-
-            // Calculate word probabilities for each class
-            let mut probabilities = HashMap::new();
-            let total_words = word_counts
-                .get(&label)
-                .unwrap_or(&HashMap::new())
-                .values()
-                .sum::<usize>() as f64;
-            let vocab_size = self.vocab.len() as f64;
-
-            for (word, &count) in word_counts.get(&label).unwrap_or(&HashMap::new()) {
-                probabilities.insert(
-                    word.clone(),
-                    (count as f64 + 1.0) / (total_words + vocab_size),
-                );
-            }
-
-            self.word_probabilities.insert(label.clone(), probabilities);
-        }
-    }
-
-    /// Classify a given text
-    pub fn classify(&self, text: &str) -> Option<String> {
-        let re = Regex::new(r"\w+").unwrap();
-        let words = re
+        let tokens: Vec<String> = re
             .find_iter(&text.to_lowercase())
             .map(|m| m.as_str().to_string())
-            .collect::<Vec<String>>();
+            .collect();
 
-        let mut scores = HashMap::new();
+        let mut best_class: Option<String> = None;
+        let mut best_score = f64::NEG_INFINITY;
 
         for (class, &class_prob) in &self.class_probabilities {
             let mut log_prob = class_prob.ln();
 
             if let Some(word_probs) = self.word_probabilities.get(class) {
-                for word in &words {
-                    let word_prob = word_probs.get(word).copied().unwrap_or(1.0 / self.vocab.len() as f64);
-                    log_prob += word_prob.ln();
+                for token in &tokens {
+                    let p = word_probs.get(token).copied().unwrap_or(1.0 / self.vocab.len() as f64);
+                    log_prob += p.ln();
                 }
             }
-
-            scores.insert(class.clone(), log_prob);
+            if log_prob > best_score {
+                best_score = log_prob;
+                best_class = Some(class.clone());
+            }
         }
 
-        scores.into_iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap()).map(|(label, _)| label)
+        best_class
     }
 
-    /// Save the model to a file
-    pub fn save_to_file(&self, path: &str) -> Result<(), NaiveBayesError> {
-        let serialized = serde_json::to_string(self).map_err(NaiveBayesError::SerializationError)?;
-        std::fs::write(path, serialized).map_err(NaiveBayesError::SaveError)?;
-        Ok(())
-    }
+    // ------------------------
+    // Dense (batch) inference
+    // ------------------------
 
-    /// Load the model from a file
-    pub fn load_from_file(path: &str) -> Result<Self, NaiveBayesError> {
-        let serialized = std::fs::read_to_string(path).map_err(NaiveBayesError::LoadError)?;
-        let model = serde_json::from_str(&serialized).map_err(NaiveBayesError::SerializationError)?;
-        Ok(model)
-    }
-}
+    /// Convert texts into a bag-of-words matrix (X).
+    /// Each row = one text, each column = word count.
+    pub fn texts_to_matrix(&self, texts: &[String]) -> Array2<f32> {
+        let mut x = Array2::<f32>::zeros((texts.len(), self.vocab.len()));
+        let re = Regex::new(r"\w+").unwrap();
 
-pub fn example(commit: Commit) {
-    let mut naive_bayes = NaiveBayes::new();
-
-    // Train with sample data
-    let training_data = vec![
-        ("economy".to_string(), "The economy is improving.".to_string()),
-        ("stock_market".to_string(), "Stock prices are rising.".to_string()),
-        ("trading".to_string(), "Trading volumes are high today.".to_string()),
-    ];
-    naive_bayes.train(training_data);
-    // Save the model
-    naive_bayes.save_to_file("naive_bayes_model.json").unwrap();
-
-    // Load the model
-    let loaded_model = NaiveBayes::load_from_file("naive_bayes_model.json").unwrap();
-
-    // Classify incoming messages
-    if let Some(record) = commit.record {
-        if let Ok(post) = serde_json::from_value::<FeedPost>(record) {
-            if let Some(label) = loaded_model.classify(&post.text) {
-                if label == "economy" || label == "stock_market" || label == "trading" {
-                    println!("Label: {}, Filtered Post: {}", label, post.text);
+        for (i, text) in texts.iter().enumerate() {
+            for token in re.find_iter(&text.to_lowercase()) {
+                if let Some(&j) = self.vocab.get(token.as_str()) {
+                    x[(i, j)] += 1.0;
                 }
             }
         }
+        x
+    }
+
+    /// Classify a batch of texts using dense matrix multiplication.
+    pub fn classify_batch_dense(&self, texts: &[String]) -> Vec<String> {
+        let wmat = match &self.wmat {
+            Some(w) => w,
+            None => panic!("Dense matrix not built! Call build_dense_matrix() first."),
+        };
+
+        let x = self.texts_to_matrix(texts);
+        let log_class_prior: Array1<f32> = self.class_labels.iter()
+            .map(|c| self.class_probabilities[c].ln() as f32)
+            .collect::<Array1<f32>>()
+            .into();
+        
+        //let scores = x.dot(&wmat.t()); // (batch_size × num_classes)
+        let scores = x.dot(&wmat.t()) + &log_class_prior;
+
+        let mut results = Vec::new();
+        for row in scores.axis_iter(Axis(0)) {
+            let (best_idx, _) = row
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .unwrap();
+            results.push(self.class_labels[best_idx].clone());
+        }
+        results
     }
 }

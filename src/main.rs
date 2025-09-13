@@ -14,18 +14,37 @@ pub mod request_parser;
 pub mod options;
 
 use std::sync::Arc;
+use anyhow::Result;
+
 
 use crate::classifiers::naive_bayes::NaiveBayes;
-
-//use crate::classifiers::naive_bayes::example;
 use crate::jetstream::WebSocketProxyServer;
 
+// -----------------------------------------------------------------------------
+// Example main — run server at 127.0.0.1:9002
+// -----------------------------------------------------------------------------
+
 #[tokio::main]
-// *** Example usage (simplified) ***
-pub async fn main() -> Result<(), Box<dyn std::error::Error>>{
-    let classifier = Arc::new(NaiveBayes::load_from_file("naive_bayes_model.json")?);
-    let address = "0.0.0.0:8080";
-    let mut ws_server = WebSocketProxyServer::new(address, classifier);
-    ws_server.run().await?;
+async fn main() -> Result<()> {
+    // Initialize tracing subscriber for logs
+    tracing_subscriber::fmt::init();
+
+    // Instantiate your NaiveBayes model (your file already provides constructors / load functions).
+    // TODO: if your NaiveBayes has a loader (e.g. NaiveBayes::load(path)) use it here.
+    let mut nb_model = NaiveBayes::load_from_file("model.json")?;
+    nb_model.build_dense_matrix();
+    let nb = Arc::new(nb_model);
+
+    // Create server
+    let server = WebSocketProxyServer::new("0.0.0.0:8080", nb);
+
+    // Optionally preload vocab and W if you have them at known paths:
+    server.load_shared_artifacts(Some("vocab.json"), Some("W.npy"));
+
+    // Run server (this never returns unless error)
+    server.run().await?;
+
     Ok(())
 }
+
+

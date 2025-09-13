@@ -1,40 +1,502 @@
+
+
+// batch_nb_complete.rs
+//
+// Single-file integration:
+// - WebSocket proxy server (accepts client connections)
+// - JetStream (ingests external events — we reuse your existing event shape)
+// - BatchManager (size + timeout flush)
+// - NdarrayTransformer (text -> Array2 bag-of-words)
+// - Optional vectorized classification using W.npy (Array2) with ndarray
+// - Fallback per-message classification using your provided NaiveBayes
+// - Pool workers run batch work in blocking threads and forward results to WS clients
+//
+// Lots of comments and TODOs throughout so you can revisit pieces later.
+//
+// NOTES:
+// - This file assumes your NaiveBayes implementation is reachable as
+//   crate::naive_bayes::NaiveBayes (adjust the `use` line if needed).
+// - Before running: add dependencies to Cargo.toml (see top of message).
+// - To enable vectorized path: prepare `vocab.json` (Vec<String>) and `W.npy` (num_classes x vocab_size).
+//   If either is missing, the code will fall back to per-message NaiveBayes classification.
+//
+// Author: ChatGPT (integrated with your NaiveBayes)
+//
+
 #![allow(dead_code)]
 #![allow(unused_imports)]
+#![allow(unused_variables)]
+#![allow(clippy::needless_pass_by_value)]
 
-use std::fmt::format;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::path::Path;
 
-//use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::{Sender, Receiver};
-use serde_json::{to_value, to_string, Value};
-use tracing::{info, error, warn, debug};
-use async_tungstenite::tokio::{TokioAdapter, connect_async};
-//use async_tungstenite::tungstenite::Message;
-use futures_util::{stream::SplitStream, StreamExt, SinkExt, Future};
-use serde::{Deserialize, Serialize};
 use tokio::task;
 use tokio_stream::wrappers::ReceiverStream;
+use futures_util::{StreamExt, SinkExt};
 use async_tungstenite::tungstenite::protocol::Message;
 use async_tungstenite::tungstenite::error::Error;
-//use futures_util::stream::SplitSink;
-use tokio::net::{TcpListener, TcpStream, lookup_host};
-use async_tungstenite::WebSocketStream;
-use tokio_native_tls::TlsStream;
-use async_tungstenite::stream::Stream;
-//use time::OffsetDateTime;
 use async_tungstenite::tokio::accept_async_with_config;
 use tungstenite::protocol::WebSocketConfig;
+use tokio::net::{TcpListener, TcpStream, lookup_host};
+use tokio::sync::mpsc::error::TrySendError;
 
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tracing::{info, warn, error, debug};
+
+use ndarray::{Array2, ArrayView2, Axis};
+use ndarray_npy::read_npy;
+use once_cell::sync::OnceCell;
+use anyhow::{Result, Context};
+
+// -----------------------------------------------------------------------------
+// Replace or adapt this import to match where your naive_bayes.rs module lives.
+// In the original repo you used: crate::classifiers::naive_bayes::NaiveBayes
+// Here we assume it's at crate::naive_bayes::NaiveBayes (change if different).
+// -----------------------------------------------------------------------------
+//use crate::naive_bayes::NaiveBayes; // <- adjust path if needed
 use crate::classifiers::naive_bayes::NaiveBayes;
 use crate::config::Config;
 use crate::logging::setup_logger;
 use crate::request_parser::params::TaskFunction;
 use crate::request_parser::parser::CallParser;
 
+// -----------------------------------------------------------------------------
+// Domain types
+// -----------------------------------------------------------------------------
 
-type WebSocketStreamType = WebSocketStream<Stream<TokioAdapter<TcpStream>, TokioAdapter<TlsStream<TcpStream>>>>;
+/// Simple message item we transport through pipeline
+#[derive(Clone, Debug)]
+pub struct MessageItem {
+    pub id: usize,
+    pub text: String,
+}
 
+/// BatchMatrix: holds the ndarray matrix and original MessageItems so we can map results back
+#[derive(Clone)]
+pub struct BatchMatrix {
+    pub x: Array2<f32>,          // shape: (batch_size, vocab_size)
+    pub items: Vec<MessageItem>, // length == batch_size
+}
+
+// -----------------------------------------------------------------------------
+// Tokenizer, Vocab, Transformer
+// -----------------------------------------------------------------------------
+
+/// Simple Vocab container mapping token -> index
+#[derive(Clone)]
+pub struct Vocab {
+    pub token_to_idx: HashMap<String, usize>,
+}
+
+impl Vocab {
+    /// Build from an iterator of tokens (ordered) - tokens[0] -> idx 0, etc.
+    pub fn new_from_iter<I: IntoIterator<Item = String>>(iter: I) -> Self {
+        let mut token_to_idx = HashMap::new();
+        for (i, tok) in iter.into_iter().enumerate() {
+            token_to_idx.insert(tok, i);
+        }
+        Self { token_to_idx }
+    }
+
+    /// Load vocab from a JSON file containing an array of tokens: ["the","to",...]
+    pub fn load_from_json<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
+        let bytes = std::fs::read(path)?;
+        let tokens: Vec<String> = serde_json::from_slice(&bytes)?;
+        Ok(Vocab::new_from_iter(tokens))
+    }
+
+    pub fn len(&self) -> usize { self.token_to_idx.len() }
+}
+
+
+pub struct  Labels {
+    pub vec: Vec<String>,
+}
+impl Labels {
+    pub fn new_from_iter<I: IntoIterator<Item = String>>(iter: I) -> Self {
+        Self { vec: iter.into_iter().collect() }
+    }
+
+    pub fn load_from_txt<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
+        // Read file as text, interpret one label per line, skip empty lines & trim whitespace.
+        let s = std::fs::read_to_string(path)?;
+        let mut vec = Vec::new();
+        for line in s.lines() {
+            let t = line.trim();
+            if !t.is_empty() {
+                vec.push(t.to_string());
+            }
+        }
+        Ok(Labels { vec })
+    }
+    
+
+    pub fn get(&self, idx: usize) -> Option<&String> {
+        self.vec.get(idx)
+    }
+
+    pub fn len(&self) -> usize {
+        self.vec.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.vec.is_empty()
+    }
+
+}
+
+impl IntoIterator for Labels {
+    type Item = String;
+    type IntoIter = std::vec::IntoIter<String>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.vec.into_iter()
+    }
+}
+
+impl std::fmt::Display for Labels {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[{}]", self.vec.join(", "))
+    }
+}
+
+
+
+/// Tokenizer: simple ASCII/word tokenizer. Replace with your project's tokenizer for exact match.
+pub struct Tokenizer;
+
+impl Tokenizer {
+    /// Basic word tokenizer: extracts word characters and lowercases.
+    pub fn tokenize<'a>(s: &'a str) -> impl Iterator<Item = String> + 'a {
+        s.split_whitespace()
+            .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
+            .filter(|t| !t.is_empty())
+            .map(|t| t.to_string())
+    }
+}
+
+/// Transformer trait — convert a batch of MessageItems into BatchMatrix
+pub trait Transformer: Send + Sync {
+    fn to_batch_matrix(&self, batch: &[MessageItem]) -> BatchMatrix;
+}
+
+/// NdarrayTransformer: real transformer building Array2 bag-of-words using provided Vocab.
+pub struct NdarrayTransformer {
+    pub vocab: Arc<Vocab>,
+}
+
+impl NdarrayTransformer {
+    pub fn new(vocab: Arc<Vocab>) -> Self {
+        Self { vocab }
+    }
+}
+
+impl Transformer for NdarrayTransformer {
+    fn to_batch_matrix(&self, batch: &[MessageItem]) -> BatchMatrix {
+        let vocab_size = self.vocab.len();
+        let batch_size = batch.len();
+
+        // Create a matrix (batch_size, vocab_size)
+        let mut x = Array2::<f32>::zeros((batch_size, vocab_size));
+
+        for (i, msg) in batch.iter().enumerate() {
+            for token in Tokenizer::tokenize(&msg.text) {
+                if let Some(&idx) = self.vocab.token_to_idx.get(&token) {
+                    // Count occurrences (bag-of-words)
+                    x[[i, idx]] += 1.0;
+                }
+            }
+        }
+
+        BatchMatrix { x, items: batch.to_vec() }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Dispatcher (decides which pool gets the BatchMatrix)
+// -----------------------------------------------------------------------------
+
+/// Dispatcher: route a BatchMatrix to a pool worker
+pub struct Dispatcher {
+    // typed channels to pools: BatchMatrix channel per pool
+    senders: Arc<Vec<mpsc::Sender<Arc<BatchMatrix>>>>,
+    rr: std::sync::atomic::AtomicUsize,
+}
+
+impl Clone for Dispatcher {
+    fn clone(&self) -> Self {
+        Dispatcher {
+            senders: Arc::clone(&self.senders),
+            rr: std::sync::atomic::AtomicUsize::new(self.rr.load(std::sync::atomic::Ordering::Relaxed)),
+        }
+    }
+}
+
+impl Dispatcher {
+    pub fn new(senders: Vec<mpsc::Sender<Arc<BatchMatrix>>>) -> Self {
+        Self { senders: Arc::new(senders), rr: std::sync::atomic::AtomicUsize::new(0) }
+    }
+
+    /// Round-robin dispatch but non-blocking try_send; if the chosen pool is full we try next
+    /// up to senders.len() times. If all full, we drop the batch (baseline). You can swap
+    /// this policy for backpressure or persistent queue later.
+    pub async fn dispatch(&self, batch: Arc<BatchMatrix>) {
+        let n = self.senders.len();
+        if n == 0 {
+            warn!("Dispatcher has no senders; dropping batch");
+            return;
+        }
+        let start = self.rr.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % n;
+        for i in 0..n {
+            let idx = (start + i) % n;
+            let tx = &self.senders[idx];
+            match tx.try_send(batch.clone()) {
+                Ok(_) => return,
+                Err(err) => match err {
+                    // If send fails because channel is full, try next. If disconnected, log and continue.
+                    tokio::sync::mpsc::error::TrySendError::Full(_) => continue,
+                    tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                        warn!("Dispatcher: pool {} channel closed", idx);
+                        continue;
+                    }
+                    _ => {
+                        // Other errors: log and try next
+                        warn!("Dispatcher send error: {}", err);
+                        continue;
+                    }   
+                }
+            }
+        }
+        // All queues full / failed - baseline policy: drop
+        warn!("All pool queues full or failed; dropping batch (baseline)");
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Pool worker: receives BatchMatrix and classifies them.
+//
+// Behavior:
+// - If an Array2 W (num_classes x vocab_size) is available, compute scores = X.dot(&W.t())
+//   and compute argmax per row (fast vectorized).
+// - Else, fallback to calling NaiveBayes::classify(&text) for each item (via nb).
+// - Results are sent over tx_results (if provided) which should be wired to WS writer or DB.
+// -----------------------------------------------------------------------------
+
+pub struct PoolWorker {
+    id: usize,
+    rx: mpsc::Receiver<Arc<BatchMatrix>>,
+    // optional W matrix for vectorized classification (num_classes x vocab_size)
+    w: Option<Arc<Array2<f32>>>,
+    // fallback classifier
+    nb: Option<Arc<NaiveBayes>>,
+    // channel to send result JSON strings to writer
+    tx_results: Option<mpsc::Sender<String>>,
+    shared_labels: OnceCell<Arc<Labels>>,
+}
+
+impl PoolWorker {
+    pub fn new(
+        id: usize,
+        rx: mpsc::Receiver<Arc<BatchMatrix>>,
+        w: Option<Arc<Array2<f32>>>,
+        nb: Option<Arc<NaiveBayes>>,
+        tx_results: Option<mpsc::Sender<String>>,
+        labels: Option<Arc<Labels>>,
+    ) -> Self {
+        let cell = OnceCell::new();
+        if let Some(l) = labels {
+            // We can unwrap safely because we're creating the OnceCell before any concurrent usage.
+            let _ = cell.set(l);
+        }
+        Self { id, rx, w, nb, tx_results, shared_labels: cell }
+    }
+
+    /// Run worker loop; receives BatchMatrix and spawns blocking tasks for CPU-bound work.
+    pub async fn run(mut self) {
+        let labels = self.shared_labels.clone();
+        while let Some(batch) = self.rx.recv().await {
+            let batch_len = batch.items.len();
+            let maybe_w = self.w.clone();
+            let maybe_nb = self.nb.clone();
+            let tx = self.tx_results.clone();
+            let id = self.id;
+
+            // Offload heavy computation to blocking threadpool
+            let labels = labels.clone();
+            task::spawn_blocking(move || {
+                if let Some(wmat) = maybe_w {
+                    // Vectorized path: scores = X.dot(W.t())
+                    // X shape: (batch_size, vocab_size)
+                    // W shape: (num_classes, vocab_size)
+                    // W.t() shape: (vocab_size, num_classes)
+                    // result shape: (batch_size, num_classes)
+                    let scores: Array2<f32> = batch.x.dot(&wmat.t());
+
+                    for (i, row) in scores.rows().into_iter().enumerate() {
+                        // compute argmax manually (because ndarray ArgMax is limited)
+                        let mut best_idx = 0usize;
+                        let mut best_val = std::f32::NEG_INFINITY;
+                        for (j, v) in row.iter().enumerate() {
+                            if *v > best_val {
+                                best_val = *v;
+                                best_idx = j;
+                            }
+                        }
+                        // Map result back to original message for context
+                        let msg = &batch.items[i];
+
+                        let label = labels
+                            .get()
+                            .and_then(|vec| vec.get(best_idx))
+                            .cloned()
+                            .unwrap_or_else(|| {
+                                error!("Labels not set or index out of range");
+                                "unknown".to_string()
+                            });
+
+                        // Build result payload — you may replace class_idx with actual label names if you have them
+                        let payload = serde_json::json!({
+                            "pool": id,
+                            "id": msg.id,
+                            "class_idx": best_idx,
+                            "label": label,
+                            "score": best_val,
+                            "text": msg.text
+                        });
+
+                        //info!("[pool {}] msg {} -> class {} score {}", id, msg.id, best_idx, best_val);
+
+                        if let Some(tx) = tx.as_ref() {
+                            // best-effort async send: spawn a tiny task
+                            let out = payload.to_string();
+                            let tx = tx.clone();
+                            let _ = tokio::spawn(async move {
+                                let _ = tx.send(out).await;
+                            });
+                        }
+                    }
+                } else if let Some(nb) = maybe_nb {
+                    // Collect all the texts from the batch into a Vec<String>
+                    let texts: Vec<String> = batch.items.iter().map(|item| item.text.clone()).collect();
+                    
+                    // Perform a single, batched classification
+                    let results = nb.classify_batch_dense(&texts);
+                    
+                    // Process the results and send them back
+                    for (i, label) in results.into_iter().enumerate() {
+                        let msg = &batch.items[i];
+                        
+                        //info!("[pool {}] msg {} -> label {}", id, msg.id, label);
+                        
+                        if let Some(tx) = tx.as_ref() {
+                            let payload = serde_json::json!({
+                                "pool": id,
+                                "id": msg.id,
+                                "label": label,
+                                "text": msg.text
+                            });
+                            let out = payload.to_string();
+                            let tx = tx.clone();
+                            let _ = tokio::spawn(async move {
+                                let _ = tx.send(out).await;
+                            });
+                        }
+                    }
+                } else {
+                    // No classifier attached; just print
+                    let batch = (*batch).clone();
+                    for msg in batch.items.into_iter() {
+                        //info!("[pool {}] msg {} - no classifier attached; text: {}", id, msg.id, msg.text);
+                    }
+                }
+            });
+            info!("Pool {} done | Size {} ", id, batch_len);
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// BatchManager: collects MessageItem into a buffer, flushes either when size hit,
+// or when timeout expires. Exposes a `feed` method for incoming messages.
+// -----------------------------------------------------------------------------
+
+pub struct BatchManager {
+    buffer: Vec<MessageItem>,
+    max_size: usize,
+    timeout_ms: u64,
+    transformer: Arc<dyn Transformer>,
+    dispatcher: Arc<Dispatcher>,
+    // To avoid requiring a tokio handle for tick in sync contexts, we keep stateful flush semantics
+    last_flush: std::time::Instant,
+}
+
+impl BatchManager {
+    /// Create a new manager. timeout_ms = 0 disables timeout flushing.
+    pub fn new(
+        max_size: usize,
+        timeout_ms: u64,
+        transformer: Arc<dyn Transformer>,
+        dispatcher: Arc<Dispatcher>,
+    ) -> Self {
+        Self {
+            buffer: Vec::with_capacity(max_size),
+            max_size,
+            timeout_ms,
+            transformer,
+            dispatcher,
+            last_flush: std::time::Instant::now(),
+        }
+    }
+
+    /// Push a message into the buffer. If a batch is ready, it is dispatched asynchronously.
+    pub async fn feed(&mut self, item: MessageItem) {
+        self.buffer.push(item);
+        let now = std::time::Instant::now();
+
+        // If buffer full -> flush
+        if self.buffer.len() >= self.max_size {
+            self.flush().await;
+            self.last_flush = now;
+            return;
+        }
+
+        // Timeout-based flush
+        if self.timeout_ms > 0 {
+            let elapsed = now.duration_since(self.last_flush).as_millis() as u64;
+            if elapsed >= self.timeout_ms && !self.buffer.is_empty() {
+                self.flush().await;
+                self.last_flush = now;
+            }
+        }
+    }
+
+    /// Force flush current buffer (if not empty)
+    pub async fn flush(&mut self) {
+        if self.buffer.is_empty() { return; }
+        // Take ownership of current buffer
+        let batch_items = std::mem::take(&mut self.buffer);
+        // Transform into BatchMatrix
+        let bm = self.transformer.to_batch_matrix(&batch_items);
+        let bm = Arc::new(bm);
+        // Dispatch (async)
+        let disp = self.dispatcher.clone();
+        disp.dispatch(bm).await;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// JetStream: original upstream feed connection handler (adapted to push MessageItem to batch_tx)
+//
+// Note: for baseline we implement two use-cases:
+//  - JetStream::handle_text(text) consumes event JSON strings and pushes eligible posts to batch_tx
+//  - In earlier code you had JetStream connecting to an external address. If you still want that,
+//    you can adapt handle_connect_async() to use connect_async and feed messages similarly.
+// -----------------------------------------------------------------------------
 
 #[derive(Deserialize)]
 struct Event {
@@ -50,7 +512,7 @@ struct Commit {
     record: Option<serde_json::Value>,
 }
 
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Deserialize, Serialize, Debug, Clone)]
 struct FeedPost {
     text: String,
 }
@@ -67,278 +529,340 @@ struct ErrorLog {
     error: String,
 }
 
-/// A struct to handle WebSocket streams
 pub struct JetStream {
-    ws_stream: WebSocketStreamType,
-    sender: Sender<String>,
-    shutdown_rx: Receiver<()>,
+    batch_tx: mpsc::Sender<MessageItem>,
 }
 
 impl JetStream {
-    /// Create a new JetStream instance
-    pub async fn new(sender: Sender<String>, shutdown_rx: Receiver<()>) -> Self {
-        let config = Config::new().unwrap();
-        let ws_addr = config.websocket.server_addr;
+    pub fn new(batch_tx: mpsc::Sender<MessageItem>) -> Self { Self { batch_tx } }
 
-        let (ws_stream, _) = connect_async(ws_addr).await.expect("Failed to connect");
-        JetStream {
-            ws_stream,
-            sender,
-            shutdown_rx,
-        }
-    }
-
-    /// Process incoming WebSocket messages
-    pub async fn handle(&mut self, classifier: &Arc<NaiveBayes>) {
-        loop {
-            tokio::select! {
-                msg = self.ws_stream.next() => {
-                    match msg {
-                        Some(Ok(msg)) if msg.is_text() => {
-                            let text = msg.into_text().unwrap();
-                            match serde_json::from_str::<Event>(&text) {
-                                Ok(event) => {
-                                    let sender_clone = self.sender.clone();
-                                    let classifier_clone = classifier.clone();
-                                    task::spawn(async move {
-                                        JetStream::forward(event, sender_clone, &classifier_clone).await;
-                                    });
-                                }
-                                Err(err) => {
-                                    error!("Failed to parse event. | Error: {}", err);
-                                }
-                            }
-                        }
-                        Some(Ok(_)) => {} // Handle other message types if needed
-                        Some(Err(err)) => {
-                            error!("JetStream handle error. | Error: {}", err);
-                            break;
-                        }
-                        None => break, // WebSocket connection closed
-                    }
-                }
-                _ = self.shutdown_rx.recv() => {
-                    info!("Shutdown signal received, closing JetStream.");
-                    // Close the WebSocket connection gracefully
-                    let _ = self.ws_stream.close(None).await;
-                    break;
-                }
-            }
-        }
-        info!("JetStream disconnected.");
-    }
-
-    /// Handle individual events
-    async fn forward(event: Event, sender: Sender<String>, classifier: &Arc<NaiveBayes>) {
-        if let Some(commit) = event.commit {
-            if commit.operation == "create" || commit.operation == "update" {
-                if commit.collection == "app.bsky.feed.post" {
-                    if let Some(record) = commit.record {
-                        if let Ok(post) = serde_json::from_value::<FeedPost>(record) {
-                            if let Some(label) = classifier.classify(&post.text) {
-                                if label == "economy" || label == "stock_market" || label == "trading" {
-                                    let log = Log {
-                                        text: post.text,
-                                        time: time::OffsetDateTime::from_unix_timestamp_nanos(event.time_us * 1000)
-                                            .unwrap()
-                                            .microsecond() as i128,
-                                        did: event
-                                        .did,
-                                    };
-                                    let log_repr = to_string(&log)
-                                        .inspect(|s| info!("Fowarded some log.| Log: {}", s))
-                                        .map_err(|err| warn!("Some error during log fowarding. | Error: {}", err))
-                                        .expect("Failed to Json encode Log ");
-                                    sender.send(log_repr).await.unwrap();
+    /// Handle a JSON event text similar to your earlier Event shape.
+    /// Pushes eligible posts into batch pipeline.
+    pub async fn handle_text(&self, text: &str) {
+        match serde_json::from_str::<Event>(text) {
+            Ok(event) => {
+                if let Some(commit) = event.commit {
+                    if (commit.operation == "create" || commit.operation == "update")
+                        && commit.collection == "app.bsky.feed.post"
+                    {
+                        if let Some(record) = commit.record {
+                            if let Ok(post) = serde_json::from_value::<FeedPost>(record) {
+                                let id = rand::random::<usize>();
+                                let msg = MessageItem { id, text: post.text };
+                                if let Err(e) = self.batch_tx.send(msg).await {
+                                    warn!("JetStream: failed to send message to batch_tx: {}", e);
                                 }
                             }
                         }
                     }
                 }
             }
+            Err(e) => {
+                warn!("JetStream: failed to parse Event JSON: {}", e);
+            }
         }
     }
 }
 
-pub struct  WebSocketProxyServer{
-    address: String,
-    classifier: Arc<NaiveBayes>,
-}
-impl WebSocketProxyServer {
-    pub fn new(addr: &str, classifier: Arc<NaiveBayes>) -> Self {
-        setup_logger("trace");
-        Self {
-            address: addr.to_string(),
-            classifier,
-        }
-    }
+// -----------------------------------------------------------------------------
+// Utilities to try-loading vocab.json and W.npy
+// -----------------------------------------------------------------------------
 
-    fn process_message(json: Value) -> Option<String> {
-        if let Ok(post) = serde_json::from_value::<FeedPost>(json) {
-            Some(format!("Processed message: {}", post.text))
-        } else {
+fn try_load_vocab<P: AsRef<Path>>(p: P) -> Option<Arc<Vocab>> {
+    match Vocab::load_from_json(p) {
+        Ok(v) => Some(Arc::new(v)),
+        Err(e) => {
+            warn!("Failed to load vocab.json: {}", e);
             None
         }
     }
+}
 
-    fn validate_message(s: &str) -> Result<(), String> {
-        info!("Parsing request...");
-        match CallParser::key_lookup_parse_json(s) {
-            Ok(req) => {
-                if req.target.to_str() == "task" {
-                    if let Some(task_args) = req.args.for_task {
-                        if let TaskFunction::RealTimeBlueSky = task_args.function {
-                            info!("Valid Request parameters were found.| Processing...");
-                            return Ok(());
-                        }
-                        return Err(format!("No valid function has been provided. 
-                        | The `args` field is missing a `function` field or the field holds an incorrect value."));
-                    }
-                    return Err(format!("There is no `args` field inside the call request json."));
-                } else {
-                    error!("Request target must be no other than `task` for this Websocket. 
-                    | Received: {}.", req.target.to_str());
-                    return  Err(format!("Request target must be no other than `task` for this Websocket. 
-                    | Received: {}.", req.target.to_str()));
-                }
-            },
-            Err(err) => {
-                error!("Request parameters are invalid.  | Args: {}. | Error: {}.", s, err);
-                return Err(format!("Request parameters are invalid.  | Args: {}. | Error: {}.", s, err))
-            }
+fn try_load_w<P: AsRef<Path>>(p: P) -> Option<Arc<Array2<f32>>> {
+    match read_npy(p) {
+        Ok(arr) => Some(Arc::new(arr)),
+        Err(e) => {
+            warn!("Failed to load W.npy: {}", e);
+            None
+        }
+    }
+}
+
+fn try_load_labels<P: AsRef<Path>>(p: P) -> Option<Arc<Labels>> {
+    match Labels::load_from_txt(p) {
+        Ok(l) => Some(Arc::new(l)),
+        Err(e) => {
+            warn!("Failed to load labels file: {}", e);
+            None
+        }
+    }
+}
+
+
+// -----------------------------------------------------------------------------
+// WebSocketProxyServer: accepts clients and wires everything together.
+// For simplicity we use one BatchManager per client connection in this baseline.
+// You could move batch manager to be global and share across connections if you prefer.
+// -----------------------------------------------------------------------------
+
+pub struct WebSocketProxyServer {
+    address: String,
+    // we keep an Arc<NaiveBayes> for fallback classification
+    nb: Arc<NaiveBayes>,
+    // optional shared W matrix / vocab (loaded once and reused). use OnceCell to load once.
+    shared_vocab: OnceCell<Arc<Vocab>>,
+    shared_w: OnceCell<Option<Arc<Array2<f32>>>>,
+}
+
+impl WebSocketProxyServer {
+    pub fn new(addr: &str, nb: Arc<NaiveBayes>) -> Self {
+        Self {
+            address: addr.to_string(),
+            nb,
+            shared_vocab: OnceCell::new(),
+            shared_w: OnceCell::new(),
         }
     }
 
-    async fn handle_connection(stream: TcpStream, classifier: Arc<NaiveBayes>) {
-        let config = Some(WebSocketConfig::default());
-
-        let ws_stream = match accept_async_with_config(stream, config).await {
-            Ok(ws_stream) => ws_stream,
-            Err(e) => {
-                error!("Error during handshake: {}", e);
-                return;
+    /// Configure shared artifacts once (optional). You can call this before run().
+    /// Example: server.load_shared_artifacts(Some("vocab.json"), Some("W.npy"));
+    pub fn load_shared_artifacts<P: AsRef<Path>>(&self, vocab_path: Option<P>, w_path: Option<P>) {
+        if let Some(v) = vocab_path {
+            if let Ok(vocab) = Vocab::load_from_json(v) {
+                let _ = self.shared_vocab.set(Arc::new(vocab));
+                info!("Loaded vocab.json into shared cache");
+            } else {
+                warn!("Failed to load shared vocab.json");
             }
+        }
+        if let Some(p) = w_path {
+            if let Ok(arr) = read_npy(p) {
+                let _ = self.shared_w.set(Some(Arc::new(arr)));
+                info!("Loaded W.npy into shared cache");
+            } else {
+                warn!("Failed to load shared W.npy");
+                let _ = self.shared_w.set(None);
+            }
+        }
+
+
+    }
+
+    /// Handle a single TCP connection (WebSocket handshake done here)
+    async fn handle_connection(&self, stream: TcpStream) {
+        let config = Some(WebSocketConfig::default());
+        let ws_stream = match accept_async_with_config(stream, config).await {
+            Ok(ws) => ws,
+            Err(e) => { error!("WebSocket accept error: {}", e); return; }
         };
 
         let (mut write, mut read) = ws_stream.split();
-        let (tx_ws, rx_ws) = mpsc::channel::<String>(100);
-        let (tx_js, rx_js) = mpsc::channel::<String>(100);
-        let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
 
-        // Create and launch JetStream for this connection
-        let mut jetstream = JetStream::new(tx_js, shutdown_rx).await;
-        let classifier_clone = classifier.clone();
-        let js_handle  = tokio::spawn(async move {
-            jetstream.handle(&classifier_clone).await;
+        // Channel to send outgoing results to the client
+        let (tx_ws, mut rx_ws) = mpsc::channel::<String>(256);
+
+        // Channel for raw MessageItems to be batched
+        let (batch_tx, mut batch_rx) = mpsc::channel::<MessageItem>(1024);
+
+        // Build transformer: prefer shared vocab, else try to load default file, else None
+        // If no vocab -> we will not use vectorized path (fallback to nb)
+        let transformer: Arc<dyn Transformer> = if let Some(v) = self.shared_vocab.get() {
+            Arc::new(NdarrayTransformer::new(v.clone()))
+        } else if let Some(vocab) = try_load_vocab("vocab.json") {
+            let _ = self.shared_vocab.set(vocab.clone());
+            Arc::new(NdarrayTransformer::new(vocab))
+        } else {
+            // No vocab available: create a toy transformer that does nothing (counts 0)
+            // But we keep the trait object to keep types consistent.
+            let empty_vocab = Arc::new(Vocab::new_from_iter(Vec::<String>::new()));
+            Arc::new(NdarrayTransformer::new(empty_vocab))
+        };
+
+        // Prepare pools: create typed channels (BatchMatrix) per pool
+        // Try to load labels once (best-effort). Use labels.txt or whatever path you have.
+        let maybe_labels: Option<Arc<Labels>> = try_load_labels("labels.txt");
+
+        let num_pools = 2_usize.max(1); // small default; tune later via config
+        let mut pool_senders: Vec<mpsc::Sender<Arc<BatchMatrix>>> = Vec::with_capacity(num_pools);
+        for i in 0..num_pools {
+            let (tx_batchmat, rx_batchmat) = mpsc::channel::<Arc<BatchMatrix>>(8);
+            pool_senders.push(tx_batchmat);
+
+            // For worker, try to use shared W if available, else None
+            let maybe_w: Option<Arc<Array2<f32>>> = match self.shared_w.get() {
+                Some(opt) => opt.clone(),
+                None => {
+                    // try to load W.npy in current dir (best-effort)
+                    try_load_w("W.npy")
+                }
+            };
+
+            // Worker uses vectorized path if W present, else falls back to NaiveBayes
+            let nb_clone = Some(self.nb.clone());
+            let tx_ws_clone = Some(tx_ws.clone());
+            let worker = PoolWorker::new(i, rx_batchmat, maybe_w.clone(), nb_clone, tx_ws_clone, maybe_labels.clone());
+            tokio::spawn(async move { worker.run().await });
+        }
+
+        // Dispatcher that takes BatchMatrix and routes to pool channels
+        // We'll wrap pool_senders into a new Arc<Vec<Sender<BatchMatrix>>> and pass to Dispatcher.
+        // Create an adapter that turns BatchMatrix into direct sends (we'll not use old trait)
+        let dispatcher = Arc::new(Dispatcher::new(pool_senders));
+
+        // Create BatchManager: buffer size and timeout ms - tuned for baseline
+        let batch_manager = BatchManager::new(
+            16,       // max batch size
+            300,      // timeout ms
+            transformer.clone(),
+            dispatcher.clone(),
+        );
+
+        // Spawn consumer that reads MessageItem from batch_rx and feeds manager.
+        // We keep manager in the consumer task to avoid mutexing it.
+        let manager_handle = tokio::spawn(async move {
+            // Note: we capture batch_manager by moving into the task
+            let mut mgr = batch_manager;
+            while let Some(msg) = batch_rx.recv().await {
+                mgr.feed(msg).await;
+            }
+            // flush remaining
+            mgr.flush().await;
         });
 
-        // Spawn task to handle outgoing messages to client
-        let ws_write_handle = tokio::spawn(async move {
-            let mut receiver_stream = ReceiverStream::new(rx_ws);
-            while let Some(msg) = receiver_stream.next().await {
-                if write.send(Message::Text(msg)).await.is_err() {
+        // Spawn writer task that sends outgoing JSON strings to the client
+        let writer_handle = tokio::spawn(async move {
+            while let Some(payload) = rx_ws.recv().await {
+                if write.send(Message::Text(payload)).await.is_err() {
+                    // client gone
                     break;
                 }
             }
         });
 
-        //Forward messages from JetStream to client ***
-        let js_to_ws_handle  = {
-            let tx_ws_ = tx_ws.clone();
-            tokio::spawn(async move {
-                let tx_ws = tx_ws_.clone();
-                let mut receiver_stream = ReceiverStream::new(rx_js);
-                while let Some(msg) = receiver_stream.next().await {
-                    if tx_ws.send(msg).await.is_err() {
-                        break;
+        // Create JetStream — we reuse its `handle_text` to parse incoming events and push eligible posts
+        let jet = JetStream::new(batch_tx.clone());
+
+        // Read loop for client: we accept either control messages or event JSON to feed jet.
+        while let Some(msg) = read.next().await {
+            match msg {
+                Ok(Message::Text(text)) => {
+                    // If text looks like an event, send to JetStream handler
+                    // (we use a simple heuristic; adjust as you prefer)
+                    if text.trim().starts_with('{') {
+                        // spawn an async task to avoid blocking read loop
+                        let jet_clone = jet.clone();
+                        let txt = text.clone();
+                        tokio::spawn(async move {
+                            jet_clone.handle_text(&txt).await;
+                        });
+                    } else {
+                        // If it's not JSON, treat as control or echo - send acknowledgement
+                        let ack = serde_json::json!({
+                            "type": "ack",
+                            "payload": text
+                        }).to_string();
+                        let _ = tx_ws.send(ack).await;
                     }
                 }
-            })
-        };
+                Ok(Message::Close(_)) => break,
+                Err(e) => {
+                    error!("Read loop error: {}", e);
+                    break;
+                }
+                _ => {}
+            }
+        }
 
-        let tx_ws_ = tx_ws.clone();
-        // Handle incoming messages
-        let handle_messages = async {
-            while let Some(msg) = read.next().await {
-                let tx_ws = tx_ws_.clone();
-                match msg {
-                    Ok(Message::Text(text)) => {
-                        // Validate the incoming message
-                        if let Err(validation_error) = Self::validate_message(&text) {
-                            error!("Invalid message received: {}. Error: {}", text, validation_error);
-                            let error_log = ErrorLog {error: validation_error};
-                            let _ = tx_ws.send(to_string(&error_log)
-                                .unwrap()).await; // Send the error message back
-                            break;
-                        }
-                        
-                        match serde_json::from_str::<Value>(&text) {
-                            Ok(json) => {
-                                //Spawn a task to send filtered posts
-                                if let Some(log) = Self::process_message(json) {
-                                    if tx_ws.send(log).await.is_err() {
-                                        break;
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                error!("Failed to parse JSON: {}", e);
-                                if let Err(_) = tx_ws.send("Invalid JSON".to_string()).await {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    Ok(Message::Close(_)) => break,
-                    Err(e) => {
-                        warn!("Error receiving message: {}", e);
-                        break;
-                    }
-                    _ => {}
+        // Client disconnected: drop batch_tx to end manager consumer
+        drop(batch_tx);
+        let _ = manager_handle.await;
+        let _ = writer_handle.await;
+        info!("Connection handler finished");
+    }
+
+    /// Start listening and accepting client connections
+    pub async fn run(&self) -> Result<()> {
+        info!("Resolving address: {}", self.address);
+        let mut addrs = lookup_host(&self.address)
+            .await
+            .context("lookup_host failed")?;
+
+        let addr = addrs.next().ok_or_else(|| anyhow::anyhow!("No addr found for host"))?;
+        let listener = TcpListener::bind(&addr).await.context("bind failed")?;
+        info!("Listening on {}", addr);
+
+        loop {
+            match listener.accept().await {
+                Ok((stream, _peer)) => {
+                    let server_clone = self.clone_for_task();
+                    tokio::spawn(async move {
+                        server_clone.handle_connection(stream).await;
+                    });
+                }
+                Err(e) => {
+                    error!("Accept failed: {}", e);
                 }
             }
-        };
-
-        tokio::select! {
-            _ = js_handle => info!("JetStream task completed."),
-            _ = ws_write_handle => info!("Write task completed."),
-            _ = js_to_ws_handle => info!("Foward task completed."),
-            _ = handle_messages =>  {
-                info!("Client message handler completed.");
-                // Send final shutdown signal if not already sent
-                let _ = shutdown_tx.send(()).await;
-            },
         }
     }
 
-    pub async fn run(&mut self) -> Result<(), Error> {
-        info!(message="Resolving address", addr=&(*self.address));
-        let mut addrs = lookup_host(&(*self.address)).await
-            .map_err(|e| error!("Error resolving address: {}", e.to_string()))
-            .unwrap();
-
-        let addr = addrs.next()
-            .ok_or_else(|| {
-            error!(err="Failed to resolve address", addr=&(*self.address));
-            Error::Url(tungstenite::error::UrlError::NoHostName)
-        })?;
-
-        info!("Setting address: {}", self.address);
-        let listener = TcpListener::bind(&addr)
-            .await
-            .map_err(|e| error!("Error: {}", e.to_string()))
-            .unwrap();
-
-        info!("WebSocket server listening on: {}", self.address);
-        while let Ok((stream, _addr)) = listener.accept().await {
-            let classifier_ = self.classifier.clone();
-            tokio::spawn(async move {
-                WebSocketProxyServer::handle_connection(stream, classifier_).await;
-            });
+    /// Helper to clone the server for use inside a tokio task
+    fn clone_for_task(&self) -> Self {
+        Self {
+            address: self.address.clone(),
+            nb: self.nb.clone(),
+            shared_vocab: self.shared_vocab.clone(),
+            shared_w: self.shared_w.clone(),
         }
-
-        Ok(())
     }
-    
 }
 
+// -----------------------------------------------------------------------------
+// Implement Clone for JetStream (it only holds a Sender)
+impl Clone for JetStream {
+    fn clone(&self) -> Self {
+        JetStream { batch_tx: self.batch_tx.clone() }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// For WebSocketProxyServer: simple constructor + main entrypoint example
+// -----------------------------------------------------------------------------
+
+impl Clone for WebSocketProxyServer {
+    fn clone(&self) -> Self {
+        Self {
+            address: self.address.clone(),
+            nb: self.nb.clone(),
+            shared_vocab: self.shared_vocab.clone(),
+            shared_w: self.shared_w.clone(),
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Example main — run server at 127.0.0.1:9002
+// -----------------------------------------------------------------------------
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Initialize tracing subscriber for logs
+    tracing_subscriber::fmt::init();
+
+    // Instantiate your NaiveBayes model (your file already provides constructors / load functions).
+    // TODO: if your NaiveBayes has a loader (e.g. NaiveBayes::load(path)) use it here.
+    let mut nb_model = NaiveBayes::load_from_file("model.json")?;
+    nb_model.build_dense_matrix();
+    let nb = Arc::new(nb_model);
+
+    // Create server
+    let server = WebSocketProxyServer::new("127.0.0.1:9002", nb);
+
+    // Optionally preload vocab and W if you have them at known paths:
+    server.load_shared_artifacts(Some("vocab.json"), Some("W.npy"));
+
+    // Run server (this never returns unless error)
+    server.run().await?;
+
+    Ok(())
+}

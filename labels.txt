@@ -1,0 +1,7 @@
+health
+sport
+science
+financial
+politics
+positive
+emotion
