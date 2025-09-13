@@ -9,7 +9,7 @@ serde_json = { version = "1.0", features = ["raw_value"] }   # JSON parsing
 tokio = {version = "1.30.0", features = ["full"]}            # Asynchronous runtime for Rust
 config = "0.13"                                              # To parse configuration .toml files
 clap = { version = "4.3", features = ["derive"] }            # Cmd args parser
-tokio-tungstenite = "0.26.1"                                   # Websocket handler
+tokio-tungstenite = "0.24.0"                                   # Websocket handler
 futures = "0.3"
 futures-util = "0.3.31"
 tracing = "0.1.41"

@@ -12,7 +12,7 @@ struct RawCallRequest {
     args: RawArgs,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct RawCaller {
     id: String,
     ipaddr: IpAddr,

@@ -28,10 +28,11 @@
 #![allow(unused_variables)]
 #![allow(clippy::needless_pass_by_value)]
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::collections::HashMap;
 use std::path::Path;
 
+use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::{Sender, Receiver};
 use tokio::task;
@@ -39,6 +40,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use futures_util::{StreamExt, SinkExt};
 use async_tungstenite::tungstenite::protocol::Message;
 use async_tungstenite::tungstenite::error::Error;
+use async_tungstenite::tokio::{TokioAdapter, connect_async};
 use async_tungstenite::tokio::accept_async_with_config;
 use tungstenite::protocol::WebSocketConfig;
 use tokio::net::{TcpListener, TcpStream, lookup_host};
@@ -52,6 +54,10 @@ use ndarray::{Array2, ArrayView2, Axis};
 use ndarray_npy::read_npy;
 use once_cell::sync::OnceCell;
 use anyhow::{Result, Context};
+
+const LABELS_PATH: &str = "C:\\Users\\cepha\\OneDrive\\Bureau\\Cube\\gaello v.2\\rs_bluesky\\labels.txt";
+const VOCAB_PATH: &str = "C:\\Users\\cepha\\OneDrive\\Bureau\\Cube\\gaello v.2\\rs_bluesky\\vocab.json";
+const W_PATH: &str = "C:\\Users\\cepha\\OneDrive\\Bureau\\Cube\\gaello v.2\\rs_bluesky\\w.npy";
 
 // -----------------------------------------------------------------------------
 // Replace or adapt this import to match where your naive_bayes.rs module lives.
@@ -106,7 +112,20 @@ impl Vocab {
     /// Load vocab from a JSON file containing an array of tokens: ["the","to",...]
     pub fn load_from_json<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
         let bytes = std::fs::read(path)?;
-        let tokens: Vec<String> = serde_json::from_slice(&bytes)?;
+        let json: Value = serde_json::from_slice(&bytes)?;
+
+        let tokens: Vec<String> = match json {
+            Value::Array(arr) => arr
+                .into_iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect(),
+            Value::Object(obj) => obj
+                .keys()
+                .cloned()
+                .collect(),
+            _ => anyhow::bail!("Unsupported vocab format"),
+        };
+
         Ok(Vocab::new_from_iter(tokens))
     }
 
@@ -263,12 +282,7 @@ impl Dispatcher {
                     tokio::sync::mpsc::error::TrySendError::Closed(_) => {
                         warn!("Dispatcher: pool {} channel closed", idx);
                         continue;
-                    }
-                    _ => {
-                        // Other errors: log and try next
-                        warn!("Dispatcher send error: {}", err);
-                        continue;
-                    }   
+                    }  
                 }
             }
         }
@@ -415,7 +429,7 @@ impl PoolWorker {
                     }
                 }
             });
-            info!("Pool {} done | Size {} ", id, batch_len);
+            //info!("Pool {} done | Size {} ", id, batch_len);
         }
     }
 }
@@ -489,6 +503,7 @@ impl BatchManager {
     }
 }
 
+
 // -----------------------------------------------------------------------------
 // JetStream: original upstream feed connection handler (adapted to push MessageItem to batch_tx)
 //
@@ -530,39 +545,85 @@ struct ErrorLog {
 }
 
 pub struct JetStream {
+    url: String,
     batch_tx: mpsc::Sender<MessageItem>,
 }
 
 impl JetStream {
-    pub fn new(batch_tx: mpsc::Sender<MessageItem>) -> Self { Self { batch_tx } }
+    pub fn new(url: &str, batch_tx: mpsc::Sender<MessageItem>) -> Self {
+        Self {
+            url: url.to_string(),
+            batch_tx,
+        }
+    }
 
-    /// Handle a JSON event text similar to your earlier Event shape.
-    /// Pushes eligible posts into batch pipeline.
-    pub async fn handle_text(&self, text: &str) {
-        match serde_json::from_str::<Event>(text) {
-            Ok(event) => {
-                if let Some(commit) = event.commit {
-                    if (commit.operation == "create" || commit.operation == "update")
-                        && commit.collection == "app.bsky.feed.post"
-                    {
-                        if let Some(record) = commit.record {
-                            if let Ok(post) = serde_json::from_value::<FeedPost>(record) {
-                                let id = rand::random::<usize>();
-                                let msg = MessageItem { id, text: post.text };
-                                if let Err(e) = self.batch_tx.send(msg).await {
-                                    warn!("JetStream: failed to send message to batch_tx: {}", e);
-                                }
-                            }
-                        }
-                    }
+    /// Connect to the Jetstream feed and continuously process events
+    pub async fn run(&self) -> anyhow::Result<()> {
+        let (ws_stream, _) = connect_async(&self.url).await?;
+        let (_, mut read) = ws_stream.split();
+
+        while let Some(msg) = read.next().await {
+            match msg {
+                Ok(Message::Text(txt)) => {
+                    self.handle_text(&txt).await;
+                }
+                Ok(Message::Close(_)) => {
+                    info!("JetStream feed closed");
+                    break;
+                }
+                Ok(_) => {} // ignore binary/ping/pong
+                Err(e) => {
+                    warn!("JetStream WS error: {}", e);
+                    break;
                 }
             }
+        }
+
+        Ok(())
+    }
+
+     /// Parse one raw JSON text message from Jetstream feed and forward eligible posts
+    /// into the batch pipeline.
+    pub async fn handle_text(&self, text: &str) {
+        // Try to parse into your Event type
+        let evt: Event = match serde_json::from_str(text) {
+            Ok(e) => e,
             Err(e) => {
                 warn!("JetStream: failed to parse Event JSON: {}", e);
+                return;
+            }
+        };
+
+        let commit = match evt.commit {
+            Some(c) => c,
+            None => return, // ignore events without commit
+        };
+
+        // Only forward create/update of feed posts
+        if (commit.operation == "create" || commit.operation == "update")
+            && commit.collection == "app.bsky.feed.post"
+        {
+            if let Some(record) = commit.record {
+                // Try to decode into FeedPost struct
+                match serde_json::from_value::<FeedPost>(record) {
+                    Ok(post) => {
+                        let msg = MessageItem {
+                            id: rand::random::<usize>(),
+                            text: post.text,
+                        };
+                        if let Err(e) = self.batch_tx.send(msg).await {
+                            warn!("JetStream: failed to send MessageItem: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        warn!("JetStream: commit.record not a FeedPost: {}", e);
+                    }
+                }
             }
         }
     }
 }
+
 
 // -----------------------------------------------------------------------------
 // Utilities to try-loading vocab.json and W.npy
@@ -656,7 +717,8 @@ impl WebSocketProxyServer {
             Err(e) => { error!("WebSocket accept error: {}", e); return; }
         };
 
-        let (mut write, mut read) = ws_stream.split();
+        let (write, mut read) = ws_stream.split();
+        let mut_write = Arc::new(Mutex::new(write));
 
         // Channel to send outgoing results to the client
         let (tx_ws, mut rx_ws) = mpsc::channel::<String>(256);
@@ -668,7 +730,7 @@ impl WebSocketProxyServer {
         // If no vocab -> we will not use vectorized path (fallback to nb)
         let transformer: Arc<dyn Transformer> = if let Some(v) = self.shared_vocab.get() {
             Arc::new(NdarrayTransformer::new(v.clone()))
-        } else if let Some(vocab) = try_load_vocab("vocab.json") {
+        } else if let Some(vocab) = try_load_vocab(VOCAB_PATH) {
             let _ = self.shared_vocab.set(vocab.clone());
             Arc::new(NdarrayTransformer::new(vocab))
         } else {
@@ -680,7 +742,7 @@ impl WebSocketProxyServer {
 
         // Prepare pools: create typed channels (BatchMatrix) per pool
         // Try to load labels once (best-effort). Use labels.txt or whatever path you have.
-        let maybe_labels: Option<Arc<Labels>> = try_load_labels("labels.txt");
+        let maybe_labels: Option<Arc<Labels>> = try_load_labels(LABELS_PATH);
 
         let num_pools = 2_usize.max(1); // small default; tune later via config
         let mut pool_senders: Vec<mpsc::Sender<Arc<BatchMatrix>>> = Vec::with_capacity(num_pools);
@@ -693,7 +755,7 @@ impl WebSocketProxyServer {
                 Some(opt) => opt.clone(),
                 None => {
                     // try to load W.npy in current dir (best-effort)
-                    try_load_w("W.npy")
+                    try_load_w(W_PATH)
                 }
             };
 
@@ -732,6 +794,8 @@ impl WebSocketProxyServer {
         // Spawn writer task that sends outgoing JSON strings to the client
         let writer_handle = tokio::spawn(async move {
             while let Some(payload) = rx_ws.recv().await {
+                println!("{}", payload);
+                let mut write = mut_write.lock().await;
                 if write.send(Message::Text(payload)).await.is_err() {
                     // client gone
                     break;
@@ -740,29 +804,23 @@ impl WebSocketProxyServer {
         });
 
         // Create JetStream — we reuse its `handle_text` to parse incoming events and push eligible posts
-        let jet = JetStream::new(batch_tx.clone());
+        let url = "wss://jetstream.atproto.tools/subscribe";
+        let jet = JetStream::new(url, batch_tx.clone());
+        let jet = Arc::new(jet);
+ 
+        let jet_copy = jet.clone();
+        tokio::spawn(async move {
+            if let Err(e) = jet_copy.run().await {
+                error!("FeedCollectorWS failed: {}", e);
+            }
+        });
 
         // Read loop for client: we accept either control messages or event JSON to feed jet.
         while let Some(msg) = read.next().await {
             match msg {
                 Ok(Message::Text(text)) => {
-                    // If text looks like an event, send to JetStream handler
-                    // (we use a simple heuristic; adjust as you prefer)
-                    if text.trim().starts_with('{') {
-                        // spawn an async task to avoid blocking read loop
-                        let jet_clone = jet.clone();
-                        let txt = text.clone();
-                        tokio::spawn(async move {
-                            jet_clone.handle_text(&txt).await;
-                        });
-                    } else {
-                        // If it's not JSON, treat as control or echo - send acknowledgement
-                        let ack = serde_json::json!({
-                            "type": "ack",
-                            "payload": text
-                        }).to_string();
-                        let _ = tx_ws.send(ack).await;
-                    }
+                    println!("{}", text);
+                    let _ = jet.handle_text(&text).await;
                 }
                 Ok(Message::Close(_)) => break,
                 Err(e) => {
@@ -821,7 +879,7 @@ impl WebSocketProxyServer {
 // Implement Clone for JetStream (it only holds a Sender)
 impl Clone for JetStream {
     fn clone(&self) -> Self {
-        JetStream { batch_tx: self.batch_tx.clone() }
+        JetStream { url: self.url.clone(), batch_tx: self.batch_tx.clone() }
     }
 }
 
@@ -859,7 +917,7 @@ async fn main() -> Result<()> {
     let server = WebSocketProxyServer::new("127.0.0.1:9002", nb);
 
     // Optionally preload vocab and W if you have them at known paths:
-    server.load_shared_artifacts(Some("vocab.json"), Some("W.npy"));
+    server.load_shared_artifacts(Some("C:\\Users\\cepha\\OneDrive\\Bureau\\Cube\\gaello v.2\\rs_bluesky\\vocab.json"), Some("C:\\Users\\cepha\\OneDrive\\Bureau\\Cube\\gaello v.2\\rs_bluesky\\w.npy"));
 
     // Run server (this never returns unless error)
     server.run().await?;
